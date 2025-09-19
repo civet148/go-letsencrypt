@@ -33,13 +33,13 @@ else
 fi
 
 echo
-echo "执行命令: ./letsencrypt $ARGS"
+echo "执行命令: ./go-letsencrypt $ARGS"
 echo
 
 # 检查程序是否存在
-if [ ! -f "./letsencrypt" ]; then
-    echo "❌ 未找到 letsencrypt 程序，请先编译："
-    echo "   go build -o letsencrypt main.go"
+if [ ! -f "./go-letsencrypt" ]; then
+    echo "❌ 未找到 go-letsencrypt 程序，请先编译："
+    echo "   go build -o go-letsencrypt main.go"
     exit 1
 fi
 
@@ -53,7 +53,7 @@ fi
 
 # 执行证书申请
 echo "开始申请证书..."
-./letsencrypt $ARGS
+./go-letsencrypt $ARGS
 
 # 检查结果
 if [ $? -eq 0 ]; then

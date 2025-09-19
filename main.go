@@ -10,18 +10,18 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"github.com/civet148/log"
-	"github.com/urfave/cli/v2"
-	"golang.org/x/crypto/acme"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/civet148/log"
+	"github.com/urfave/cli/v2"
+	"golang.org/x/crypto/acme"
 )
 
 const (
-	SshScheme   = "ssh://"
 	Version     = "0.1.0"
 	ProgramName = "go-letsencrypt"
 )
@@ -37,6 +37,8 @@ const (
 	CmdFlag_Staging = "staging"
 	CmdFlag_CertDir = "cert-dir"
 	CmdFlag_Port    = "port"
+	CmdFlag_DNSOnly = "dns-only"
+	CmdFlag_Manual  = "manual"
 )
 
 const (
@@ -54,6 +56,8 @@ type CertManager struct {
 	certDir    string
 	email      string
 	staging    bool
+	dnsOnly    bool
+	manual     bool
 }
 
 func main() {
@@ -90,6 +94,17 @@ func main() {
 				Name:    CmdFlag_Port,
 				Usage:   "Let's Encrypt http check port",
 				Aliases: []string{"p"},
+				Value:   "80",
+			},
+			&cli.BoolFlag{
+				Name:    CmdFlag_DNSOnly,
+				Usage:   "Use DNS-01 challenge only (recommended for domains without HTTP access)",
+				Aliases: []string{"dns"},
+			},
+			&cli.BoolFlag{
+				Name:    CmdFlag_Manual,
+				Usage:   "Manual DNS record setup (you manually add DNS TXT record)",
+				Aliases: []string{"M"},
 			},
 		},
 		Action: func(ctx *cli.Context) error {
@@ -98,9 +113,11 @@ func main() {
 			var certDir = ctx.String(CmdFlag_CertDir)
 			var staging = ctx.Bool(CmdFlag_Staging)
 			var port = ctx.String(CmdFlag_Port)
+			var dnsOnly = ctx.Bool(CmdFlag_DNSOnly)
+			var manual = ctx.Bool(CmdFlag_Manual)
 
 			// 创建证书管理器
-			cm, err := NewCertManager(email, certDir, staging)
+			cm, err := NewCertManager(email, certDir, staging, dnsOnly, manual)
 			if err != nil {
 				return log.Errorf("创建证书管理器失败: %v", err.Error())
 			}
@@ -111,6 +128,12 @@ func main() {
 				}
 				return "生产环境"
 			}())
+
+			if dnsOnly || manual {
+				log.Infof("使用DNS-01验证方式")
+			} else {
+				log.Infof("使用HTTP-01验证方式")
+			}
 
 			// 申请证书
 			err = cm.ObtainCertificate(domain, port)
@@ -130,7 +153,7 @@ func main() {
 }
 
 // NewCertManager 创建新的证书管理器
-func NewCertManager(email, certDir string, staging bool) (*CertManager, error) {
+func NewCertManager(email, certDir string, staging, dnsOnly, manual bool) (*CertManager, error) {
 	// 确保证书目录存在
 	if err := os.MkdirAll(certDir, 0755); err != nil {
 		return nil, log.Errorf("创建证书目录失败: %v", err)
@@ -160,6 +183,8 @@ func NewCertManager(email, certDir string, staging bool) (*CertManager, error) {
 		certDir:    certDir,
 		email:      email,
 		staging:    staging,
+		dnsOnly:    dnsOnly,
+		manual:     manual,
 	}
 
 	return cm, nil
@@ -224,7 +249,11 @@ func (cm *CertManager) ObtainCertificate(domain, port string) error {
 
 	// 处理授权质询
 	for _, authzURL := range order.AuthzURLs {
-		err = cm.handleAuthorization(ctx, authzURL, port)
+		if cm.dnsOnly || cm.manual {
+			err = cm.handleDNSAuthorization(ctx, authzURL)
+		} else {
+			err = cm.handleHTTPAuthorization(ctx, authzURL, port)
+		}
 		if err != nil {
 			return log.Errorf("处理授权质询失败: %v", err)
 		}
@@ -270,6 +299,11 @@ func (cm *CertManager) registerAccount(ctx context.Context) error {
 			log.Infof("账户已存在")
 			return nil
 		}
+		// 对于其他类型的账户存在错误
+		if strings.Contains(err.Error(), "account already exists") {
+			log.Infof("账户已存在")
+			return nil
+		}
 		return err
 	}
 
@@ -277,8 +311,8 @@ func (cm *CertManager) registerAccount(ctx context.Context) error {
 	return nil
 }
 
-// handleAuthorization 处理域名授权质询
-func (cm *CertManager) handleAuthorization(ctx context.Context, authzURL, port string) error {
+// handleHTTPAuthorization 处理HTTP-01域名授权质询
+func (cm *CertManager) handleHTTPAuthorization(ctx context.Context, authzURL, port string) error {
 	// 获取授权信息
 	authz, err := cm.client.GetAuthorization(ctx, authzURL)
 	if err != nil {
@@ -445,4 +479,88 @@ func (cm *CertManager) displayCertInfo(certPath string) error {
 	log.Infof("序列号: %s", cert.SerialNumber)
 
 	return nil
+}
+
+// handleDNSAuthorization 处理DNS-01质询
+func (cm *CertManager) handleDNSAuthorization(ctx context.Context, authzURL string) error {
+	authz, err := cm.client.GetAuthorization(ctx, authzURL)
+	if err != nil {
+		return err
+	}
+
+	if authz.Status == acme.StatusValid {
+		log.Infof("域名 %s 已通过验证", authz.Identifier.Value)
+		return nil
+	}
+
+	// 寻找DNS-01质询
+	var dnsChallenge *acme.Challenge
+	for _, challenge := range authz.Challenges {
+		if challenge.Type == "dns-01" {
+			dnsChallenge = challenge
+			break
+		}
+	}
+
+	if dnsChallenge == nil {
+		return log.Errorf("未找到DNS-01质询")
+	}
+
+	// 计算DNS记录值
+	keyAuth, err := cm.client.DNS01ChallengeRecord(dnsChallenge.Token)
+	if err != nil {
+		return err
+	}
+
+	domain := authz.Identifier.Value
+	recordName := "_acme-challenge." + domain
+
+	log.Infof("=== DNS验证配置 ===")
+	log.Infof("请在您的DNS提供商处添加以下TXT记录:")
+	log.Infof("记录名称: %s", recordName)
+	log.Infof("记录类型: TXT")
+	log.Infof("记录值: %s", keyAuth)
+	log.Infof("TTL: 120 (推荐)")
+	log.Infof("==================")
+
+	if cm.manual {
+		log.Infof("请手动添加上述DNS TXT记录，然后按任意键继续...")
+		fmt.Scanln()
+
+		// 等待DNS传播
+		log.Infof("等待DNS记录传播（60秒）...")
+		time.Sleep(60 * time.Second)
+	} else {
+		log.Infof("自动化DNS管理功能暂未实现，请手动添加DNS记录")
+		log.Infof("添加完成后按任意键继续...")
+		fmt.Scanln()
+	}
+
+	// 接受质询
+	log.Infof("开始验证域名 %s...", domain)
+	_, err = cm.client.Accept(ctx, dnsChallenge)
+	if err != nil {
+		return err
+	}
+
+	// 等待质询完成
+	for i := 0; i < 60; i++ {
+		authz, err = cm.client.GetAuthorization(ctx, authzURL)
+		if err != nil {
+			return err
+		}
+
+		if authz.Status == acme.StatusValid {
+			log.Infof("域名 %s 验证成功", domain)
+			return nil
+		}
+
+		if authz.Status == acme.StatusInvalid {
+			return log.Errorf("域名验证失败")
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+
+	return log.Errorf("域名验证超时")
 }
