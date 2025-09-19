@@ -1,0 +1,26 @@
+# 编译后的二进制文件
+letsencrypt
+go-letsencrypt
+
+# 证书文件目录
+certs/
+*.crt
+*.key
+*.pem
+
+# Go相关
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp
