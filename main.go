@@ -32,13 +32,15 @@ var (
 )
 
 const (
-	CmdFlag_Domain  = "domain"
-	CmdFlag_Email   = "email"
-	CmdFlag_Staging = "staging"
-	CmdFlag_CertDir = "cert-dir"
-	CmdFlag_Port    = "port"
-	CmdFlag_DNSOnly = "dns-only"
-	CmdFlag_Manual  = "manual"
+	CmdFlag_Domain       = "domain"
+	CmdFlag_Email        = "email"
+	CmdFlag_Staging      = "staging"
+	CmdFlag_CertDir      = "cert-dir"
+	CmdFlag_Port         = "port"
+	CmdFlag_DNSOnly      = "dns-only"
+	CmdFlag_Manual       = "manual"
+	CmdFlag_AliyunKey    = "aliyun-key"
+	CmdFlag_AliyunSecret = "aliyun-secret"
 )
 
 const (
@@ -51,13 +53,15 @@ const (
 )
 
 type CertManager struct {
-	client     *acme.Client
-	accountKey crypto.Signer
-	certDir    string
-	email      string
-	staging    bool
-	dnsOnly    bool
-	manual     bool
+	client       *acme.Client
+	accountKey   crypto.Signer
+	certDir      string
+	email        string
+	staging      bool
+	dnsOnly      bool
+	manual       bool
+	aliyunKey    string
+	aliyunSecret string
 }
 
 func main() {
@@ -106,6 +110,16 @@ func main() {
 				Usage:   "Manual DNS record setup (you manually add DNS TXT record)",
 				Aliases: []string{"M"},
 			},
+			&cli.StringFlag{
+				Name:    CmdFlag_AliyunKey,
+				Usage:   "Aliyun AccessKey ID (appid) for automatic DNS management",
+				Aliases: []string{"ak", "appid"},
+			},
+			&cli.StringFlag{
+				Name:    CmdFlag_AliyunSecret,
+				Usage:   "Aliyun AccessKey Secret (appsecret) for automatic DNS management",
+				Aliases: []string{"as", "sk", "appsecret"},
+			},
 		},
 		Action: func(ctx *cli.Context) error {
 			var domain = ctx.String(CmdFlag_Domain)
@@ -115,9 +129,11 @@ func main() {
 			var port = ctx.String(CmdFlag_Port)
 			var dnsOnly = ctx.Bool(CmdFlag_DNSOnly)
 			var manual = ctx.Bool(CmdFlag_Manual)
+			var aliyunKey = ctx.String(CmdFlag_AliyunKey)
+			var aliyunSecret = ctx.String(CmdFlag_AliyunSecret)
 
 			// 创建证书管理器
-			cm, err := NewCertManager(email, certDir, staging, dnsOnly, manual)
+			cm, err := NewCertManager(email, certDir, staging, dnsOnly, manual, aliyunKey, aliyunSecret)
 			if err != nil {
 				return log.Errorf("创建证书管理器失败: %v", err.Error())
 			}
@@ -130,7 +146,13 @@ func main() {
 			}())
 
 			if dnsOnly || manual {
-				log.Infof("使用DNS-01验证方式")
+				if aliyunKey != "" && aliyunSecret != "" {
+					log.Infof("使用DNS-01验证方式(阿里云自动化)")
+				} else if manual {
+					log.Infof("使用DNS-01验证方式(手动)")
+				} else {
+					log.Infof("使用DNS-01验证方式")
+				}
 			} else {
 				log.Infof("使用HTTP-01验证方式")
 			}
@@ -153,7 +175,7 @@ func main() {
 }
 
 // NewCertManager 创建新的证书管理器
-func NewCertManager(email, certDir string, staging, dnsOnly, manual bool) (*CertManager, error) {
+func NewCertManager(email, certDir string, staging, dnsOnly, manual bool, aliyunKey, aliyunSecret string) (*CertManager, error) {
 	// 确保证书目录存在
 	if err := os.MkdirAll(certDir, 0755); err != nil {
 		return nil, log.Errorf("创建证书目录失败: %v", err)
@@ -178,13 +200,15 @@ func NewCertManager(email, certDir string, staging, dnsOnly, manual bool) (*Cert
 	}
 
 	cm := &CertManager{
-		client:     client,
-		accountKey: accountKey,
-		certDir:    certDir,
-		email:      email,
-		staging:    staging,
-		dnsOnly:    dnsOnly,
-		manual:     manual,
+		client:       client,
+		accountKey:   accountKey,
+		certDir:      certDir,
+		email:        email,
+		staging:      staging,
+		dnsOnly:      dnsOnly,
+		manual:       manual,
+		aliyunKey:    aliyunKey,
+		aliyunSecret: aliyunSecret,
 	}
 
 	return cm, nil
@@ -523,7 +547,18 @@ func (cm *CertManager) handleDNSAuthorization(ctx context.Context, authzURL stri
 	log.Infof("TTL: 120 (推荐)")
 	log.Infof("==================")
 
-	if cm.manual {
+	if cm.aliyunKey != "" && cm.aliyunSecret != "" {
+		log.Infof("使用阿里云DNS自动添加记录...")
+		aliyunDNS := NewAliyunDNS(cm.aliyunKey, cm.aliyunSecret)
+		err = aliyunDNS.AddLetsencryptRecord(domain, keyAuth)
+		if err != nil {
+			return log.Errorf("阿里云DNS记录添加失败: %v", err)
+		}
+
+		// 等待DNS传播
+		log.Infof("等待DNS记录传播（30秒）...")
+		time.Sleep(30 * time.Second)
+	} else if cm.manual {
 		log.Infof("请手动添加上述DNS TXT记录，然后按任意键继续...")
 		fmt.Scanln()
 
@@ -552,6 +587,14 @@ func (cm *CertManager) handleDNSAuthorization(ctx context.Context, authzURL stri
 
 		if authz.Status == acme.StatusValid {
 			log.Infof("域名 %s 验证成功", domain)
+
+			// 自动清理DNS记录
+			if cm.aliyunKey != "" && cm.aliyunSecret != "" {
+				log.Infof("自动清理DNS记录...")
+				aliyunDNS := NewAliyunDNS(cm.aliyunKey, cm.aliyunSecret)
+				aliyunDNS.DeleteLetsencryptRecord(domain) // 忽略错误，不影响证书申请
+			}
+
 			return nil
 		}
 
